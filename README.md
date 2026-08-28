@@ -151,7 +151,5 @@ stored.
 
 ---
 
-Built by **Hellish** · [x.com/Hellishnum1](https://x.com/Hellishnum1) · [github.com/hossein6191](https://github.com/hossein6191)
-
 MIT licensed. Take the sandbox walls, the behaviour comparison, or the whole
 thing.
