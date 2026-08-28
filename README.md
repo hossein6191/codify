@@ -137,6 +137,52 @@ raises is a *broken* rule, not a rejected subject, and it says so. Returning
 `False` for a broken rule would look like an ordinary rejection; returning `True`
 would wave everything through.
 
+## Verified on the Studio network
+
+Deployed from the author's own wallet `0x0A9fd8Fe0b041974e8F794fCf3Eed352c14cf5fe`
+against `studio.genlayer.com`. The deployed bytecode is byte-identical to
+`contracts/codify.py` in this repo (sha256
+`9f6caa6f39b25bd8210f317e63d4ce462885b4d4c0f05887d91b4edc49367b6f`), and the code
+pulled back off the chain passes `genvm-lint check` — pull it out of the deploy
+transaction and hash it yourself.
+
+Contract [`0x3Bdc3C84…`](https://explorer-studio.genlayer.com/address/0x3Bdc3C840f646caE6B63eE470d2947FfDC92a697)
+([deploy ↗](https://explorer-studio.genlayer.com/tx/0x25aac7a26e11d086c8f5c9c503fa9f766d8b519f9e5b8851ab14e129207d9a12))
+
+**Rule set `no-spam`.** Three rules in English, compiled once.
+[propose ↗](https://explorer-studio.genlayer.com/tx/0x3db6be9bb3b0a918eaf91f69e79ec8157e115ad0657ca52c842db718d3c57cfb)
+— 3 agree, 0 disagree, 2 idle.
+
+| the rule, as written | the Python it became |
+|---|---|
+| the text must be at most 280 characters | `len(text) <= 280` |
+| it must not contain a URL | `'http://' not in text and 'https://' not in text` |
+| it must have at most two hashtags | `text.count('#') <= 2` |
+
+Then, with no model involved at all:
+
+```
+check("no-spam", "an ordinary sentence with #one tag")   → passes, TTT
+check("no-spam", "buy now http://x.example #a #b #c")    → fails,  TFF
+```
+
+Read it back with `explain("no-spam")` or run `check` yourself. It costs nothing
+and it will answer the same thing forever.
+
+**The same three rules have now been compiled three times, and produced three
+different programs.**
+
+```
+run 1   text.find('http://') == -1 and text.find('https://') == -1 and text.find('www.') == -1
+run 2   all(s not in text for s in ('http://', 'https://', 'www.'))
+run 3   'http://' not in text and 'https://' not in text
+```
+
+All three are correct. No two are the same string. This is the whole argument for
+comparing behaviour rather than characters, and it is not a hypothetical — a
+contract that demanded identical code would have failed every one of these runs
+and never stored a rule at all.
+
 ## Tests
 
 ```

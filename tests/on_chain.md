@@ -27,15 +27,16 @@ all(s not in text for s in ('http://', 'https://', 'www.'))
 sum(1 for c in text if c == '#') <= 2
 ```
 
-**Run twice, the model wrote different code both times.** An earlier run of the
-same rules produced:
+**Compiled three times, the model wrote three different programs.**
 
 ```
-text.find('http://') == -1 and text.find('https://') == -1 and text.find('www.') == -1
-text.count('#') <= 2
+run 1   text.find('http://') == -1 and text.find('https://') == -1 and text.find('www.') == -1
+run 2   all(s not in text for s in ('http://', 'https://', 'www.'))
+run 3   'http://' not in text and 'https://' not in text
 ```
 
-Both are correct. Neither is the same string. This is the entire reason
+All three are correct. No two are the same string. The third is the one deployed
+from the author's wallet at `0x3Bdc3C84…`, which reached 3 agree and 0 disagree. This is the entire reason
 validators compare behaviour rather than characters — a contract demanding
 identical code would have rejected every honest validator in both runs and never
 stored a rule at all.
