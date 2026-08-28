@@ -36,10 +36,12 @@ run 3   'http://' not in text and 'https://' not in text
 ```
 
 All three are correct. No two are the same string. The third is the one deployed
-from the author's wallet at `0x3Bdc3C84…`, which reached 3 agree and 0 disagree. This is the entire reason
-validators compare behaviour rather than characters — a contract demanding
-identical code would have rejected every honest validator in both runs and never
-stored a rule at all.
+from the author's own wallet at `0x3Bdc3C84…`, which reached 3 agree and 0
+disagree.
+
+This is the entire reason validators compare behaviour rather than characters. A
+contract demanding identical code would have failed all three of these runs and
+never stored a rule at all.
 
 | what | result |
 |---|---|
