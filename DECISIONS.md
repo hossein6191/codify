@@ -3,195 +3,177 @@
 Everything below was checked on the GenLayer Studio network or against the code
 as it runs. Where something is untested it says so.
 
-## `spawn_sandbox` isolates state. It does not bound work.
+## The redesign, and the review that caused it
 
-This is the most important thing in this file, the name says the opposite, and
-getting it wrong would have shipped a contract that any author could stall.
+The first version of this contract asked the model for arbitrary Python, one
+expression per rule, and had validators agree when the leader's expressions and
+their own produced the same results on the author's examples plus some mutations
+generated from them. It was submitted, and refused:
 
-Measured on probe `0x402e153B3463C5dEDb85661e6fA49a41779eC4E9`, expressions
-evaluated inside `gl.vm.spawn_sandbox`:
+> The contract has a thoughtful compile-once design, but the validator only
+> compares generated expressions on a finite set of examples and mutations. A
+> leader expression can match every tested subject while behaving differently on
+> a later input, and that stored expression controls future checks and downstream
+> contract decisions. Please redesign consensus so validators independently bind
+> the full consequential policy rather than accepting finite probe equivalence.
 
-| expression | result |
-|---|---|
-| `sum(1 for _ in range(1000))` | SUCCESS, 39 s |
-| `sum(1 for _ in range(50000000))` | **SUCCESS, 63 s** |
-| `len(text * 100000000)` | **SUCCESS** — a 300 MB string, allocated and measured |
-| `len(().__class__.__bases__[0].__subclasses__())` | **SUCCESS — 335 classes reachable** |
+That is correct, and it is worth being precise about why, because the old design
+looked careful.
 
-Nothing was cut short. Fifty million iterations ran to completion; a three
-hundred megabyte allocation succeeded. The sandbox keeps an expression from
-touching contract state, which is what it is for, and it will happily let one
-take as long as it likes doing nothing.
+Two programs can agree on every subject anyone thought to try and part company on
+the next one. The mutations helped — they caught expressions overfitted to the
+examples — but they only widened the sample. They did not close it. And the thing
+that got stored was the **leader's** program: every later `check`, and every
+contract reading `check`, would obey a program the validators had approved a
+sample of the behaviour of. They had ratified an extrapolation.
 
-So every bound in this contract is in this contract. There is no backstop
-underneath it.
+Adding more probes could not fix it. There is no finite set of subjects whose
+agreement implies agreement everywhere, so the fix had to remove the gap rather
+than narrow it.
 
-## A restricted `eval` is not a sandbox
+## What replaced it: a closed catalogue
 
-Removing names from `__builtins__` looks like it shuts the door. It does not,
-because the classic escape never uses a name:
+The model no longer writes code. It chooses, for each English rule, one predicate
+from a fixed table and fills in its arguments:
 
-```python
-().__class__.__bases__[0].__subclasses__()
+```json
+{"op": "max_chars", "n": 280}
+{"op": "forbid", "any": ["http://", "https://"], "ci": true}
+{"op": "max_count", "of": "#", "n": 2, "ci": true}
 ```
 
-Locally that reaches **516 classes** with builtins cut to the allowed list —
-`Popen`, `BuiltinImporter`, `FileLoader`, `_wrap_close` among them. On chain,
-inside `spawn_sandbox`, it reaches 335. An attribute lookup on a tuple gets to
-`object`, and `object` knows every subclass in the process.
+Validators then compare the **whole policy** in canonical form — every predicate
+and every argument — as an exact string. Not a sample of what it does. There is
+no later input on which the stored policy can differ from what each validator
+approved, because each validator approved all of it.
 
-Blocklists of *names* are therefore beside the point. What is refused instead is
-the shape: an expression containing `__` never runs at all. Every version of
-that escape needs a dunder, and no honest rule about a piece of text has ever
-wanted one. `lambda`, `import`, `:=` and `;` go the same way, for the same
-reason: a rule is an expression, and none of those belong in one.
+`{"op":"max_chars","n":280}` and `{"op":"max_chars","n":281}` agree on every
+subject anybody would naturally test and are plainly different policies. The
+pure tests pin exactly that case, because it is the shape of the bug the old
+design could not see.
 
-## The bounds, and why each one is there
+### What canonicalisation settles, and what it must not
 
-| refused | because |
+| difference | treated as |
 |---|---|
-| `__` | the escape above; every form of it needs a dunder |
-| `lambda`, `:=`, `;` | a rule is one expression; these are how it stops being one |
-| `import` | there is nothing to import and nothing that should be |
-| `**` | the compact way to write a number large enough to hurt |
-| any run of 5+ digits | the other way; a subject caps at 2000, so 9999 is generous |
-| `range` (absent, not banned) | every remaining name iterates over `text`, which is capped |
+| `["https://","http://"]` vs `["http://","https://"]` | the same policy — lists are sorted |
+| a repeated entry in a list | the same policy — duplicates are dropped |
+| `{"n":280}` vs `{"n":281}` | different policies |
+| rule order | different policies; the order is the author's |
+| an argument the predicate does not take | **refused**, not ignored |
 
-`range` is the only name in a plausible vocabulary that lets one short
-expression ask for unbounded work, so it is simply not there. What is left can
-loop over the subject and no further.
+That last row matters more than it looks. A field quietly dropped is a
+difference between two validators that neither of them can see, which is the
+same failure the review described, arriving by a different door.
 
-Together these mean the worst an expression can do is walk a 2000 character
-string a few thousand times. That is a bound, not a hope.
+## Measured: validators really do disagree now
 
-## Validators compare behaviour, not code
+On chain, binding three English rules with the redesigned contract:
 
-Two people asked to write Python for *"at most two hashtags"* will not write the
-same characters:
+```
+votes: 3 agree, 2 disagree, 0 idle  →  applied
 
-```python
-text.count("#") <= 2
-len([c for c in text if c == "#"]) < 3
-not text.count("#") > 2
+{"n":280,"op":"max_chars"}
+{"any":["http://","https://","www."],"ci":true,"op":"forbid"}
+{"ci":false,"n":2,"of":"#","op":"max_count"}
 ```
 
-All three are the same rule. A contract that compared the strings would reject
-every honest validator it ever had, and one that asked a model whether two
-snippets are equivalent would be back to trusting a model about the thing it was
-supposed to check.
+Two validators bound a *different* policy and said so. Under the old design the
+same two might well have been recorded as agreeing, because their programs would
+have behaved identically on the probe subjects. The disagreement is not a
+failure — it is the mechanism working, and it is visible now where before it was
+invisible.
 
-So the comparison is by execution. The leader's expressions and the validator's
-own are both run over the same list of subjects, and the validator agrees when
-the two produce an identical string of `T`, `F` and `E`. Code is compared by
-what it does, which is the only property anyone actually cares about.
+## What removing `eval` also removed
 
-## Errors are a third outcome, not a kind of false
+The old version ran model-written code inside `gl.vm.spawn_sandbox`. That is gone
+with it, and so are three problems measured while trying to make it safe. They
+are recorded here because they are true of GenLayer generally, and anybody
+reaching for the same pattern should know them.
 
-`_run_one` returns `T`, `F` or `E`. An expression that raises is not a rule that
-failed — it is a rule that is broken, and the two must not be confused.
+**A restricted `eval` is not a sandbox.** With `__builtins__` cut down to a safe
+list, `().__class__.__bases__[0].__subclasses__()` still reached **516 classes**
+locally and **335 on chain** — `Popen`, `BuiltinImporter`, `FileLoader` among
+them. The escape never goes through a name, so removing names does not close it.
 
-Returning `False` for a broken rule would make it look like an ordinary
-rejection; returning `True` would wave everything through. The third letter
-means a broken rule is visible in `check`, visible in the stored behaviour
-string, and visible to a validator comparing behaviour, so it cannot pass
-quietly in either direction.
+**`spawn_sandbox` isolates state, not work.** Measured on probe
+`0x402e153B3463C5dEDb85661e6fA49a41779eC4E9`:
+`sum(1 for _ in range(50000000))` ran to completion in 63 seconds, and
+`len(text * 100000000)` allocated a 300 MB string. Nothing was cut short. Any
+contract that runs supplied code must bound it itself; there is no backstop
+underneath.
+
+**A probe can answer the wrong question.** The first sandbox probe reported that
+an infinite loop was stopped. It was not — the loop died of `NameError` because
+`range` was not in that probe's vocabulary, so it never looped at all. The
+question went unanswered until it was asked again properly, and the second
+answer was the opposite of the first.
+
+None of these can bite this contract any more, because it executes its own
+predicates in ordinary Python and there is no supplied code anywhere.
 
 ## The examples are the specification
 
 `propose` refuses a rule set unless it comes with at least one example that
-should pass **and** one that should fail.
+should pass **and** one that should fail. A rule set never shown something it
+ought to reject has not been specified, only described.
 
-A rule set that has never been shown something it ought to reject has not been
-specified, only described. And the pair is what makes the deterministic gate
-possible: after consensus produces the code, the code is run against the
-examples in ordinary Python, and if it disagrees with the author about a single
-one, nothing is stored. The model's work is checked by execution rather than by
-another model.
+After consensus fixes the policy, the policy is run against those examples in
+ordinary code. If it disagrees with the author about one of them, nothing is
+stored and the bound predicates are handed back so the author can see what was
+written for them and where it diverged. The model's work is checked by execution
+rather than by another model.
 
-## The probes the author did not choose
+## Errors are refusals, not results
 
-An expression can satisfy every example it was shown and still be wrong, because
-the model could see those examples while it was writing.
+Refusals raise `gl.vm.UserError`. A failed `assert` reaches the explorer as
+`exit_code 1` with the reason thrown away, which tells somebody whose rule set
+was refused nothing at all.
 
-So the subjects used for validator comparison are the examples **plus**
-mutations generated from them by code: the empty string, the first half of the
-first example, that example doubled, and it uppercased. Nobody picked them — not
-the author, not the model — and an expression that only works on what it was
-shown comes apart on them.
+The one place a refusal is *returned* rather than raised — the policy
+disagreeing with the examples — is deliberate: nothing has been written at that
+point, and the caller needs the policy back to see what went wrong.
 
-The pure tests demonstrate the case: `len(text) <= 11` and
-`text in ('hello world', 'no')` agree on every example and disagree on the
-probes.
-
-## Calling another GenLayer contract is not `gl.evm.contract_interface`
-
-The two look interchangeable and one of them does not work.
+## Calling this contract from another one
 
 `@gl.evm.contract_interface` describes an **EVM** contract. Pointing it at a
-GenLayer contract compiles, lints, and passes validation — and then the deploy
-dies in the constructor with `exit_code 1`, which says nothing about why. Three
-subsequent calls to the address answer `Contract ... not found`, because nothing
-was ever deployed there.
-
-The pattern that works is the one `schema-oracle` already uses:
+GenLayer contract lints, validates, and then dies in the constructor with
+`exit_code 1`, after which the address answers `Contract ... not found`. The
+pattern that works:
 
 ```python
 raw = gl.get_contract_at(self.other).view().check(name, subject)
 ```
 
-`contracts/fixtures/gate.py` is a working consumer, and the difference between
-the version that failed and the version that works is those two lines.
+`contracts/fixtures/gate.py` is a working consumer built on it.
 
-## A view call over RPC cannot carry a long argument. Contract to contract can.
+## A view call over RPC cannot carry a long argument
 
-Measured against a deployed Codify, calling `check(name, subject)` with subjects
-of increasing length:
+Measured against a deployed Codify, calling `check(name, subject)`:
 
 | subject | result |
 |---|---|
-| 10, 50, 100, 200 characters | fine |
+| up to 200 characters | fine |
 | 300 characters | `RLP string ends with 333 superfluous bytes` |
-| 500 characters | `RLP string ends with 533 superfluous bytes` |
 | 1000 characters | `RLP string ends with 1033 superfluous bytes` |
 
-The number of "superfluous" bytes tracks the argument, so the whole payload is
-being rejected somewhere past about 250 characters.
+The count of "superfluous" bytes tracks the argument, so the whole payload is
+rejected somewhere past about 250 characters. It is specific to `gen_call`: a
+**write** carrying ~1900 characters was processed normally, a view *returning*
+586 characters was fine, and a 268-character subject passed through
+`gl.get_contract_at(...).view().check(...)` without trouble.
 
-It is specific to `gen_call`. In the same session:
+`_MAX_SUBJECT` stays at 2000 because that is what the contract can take. Anyone
+reading it straight from a browser will hit a wall of the node's own first.
 
-- a **write** carrying a ~1900 character payload was accepted and processed
-  normally, and the model compiled `len(text) < 900` from it;
-- a view **returning** 586 characters was fine;
-- and a 268 character subject — comfortably past the limit — went through
-  `gl.get_contract_at(...).view().check(...)` from `Gate` without trouble.
+## What is still not covered
 
-So the ceiling belongs to the RPC path, not to the contract, the network, or
-composition. `_MAX_SUBJECT` stays at 2000 because that is what the contract can
-actually take; anyone reading it straight from a browser over `gen_call` should
-know they will hit a wall of the node's own long before that.
+Adversarial rule text. The author writes the English and the English reaches the
+model, so an attempt to steer the binding through the rules themselves is a real
+avenue.
 
-## Why there is no model in `check`
-
-`check` is a view. It runs stored code, deterministically, for free, and returns
-the same answer for everybody forever.
-
-That is the whole point of the contract, and it is the opposite of the usual
-shape. A contract that puts a model in front of every decision pays for it every
-time, in latency, in cost, and in the chance that five validators do not agree.
-Here the model is asked one question, once, in public, and what it produced is
-readable by anyone the rule will ever be applied to.
-
-## Refusals raise; they do not assert and they do not return
-
-A failed `assert` reaches the explorer as `exit_code 1` with the reason thrown
-away. `raise gl.vm.UserError(msg)` carries the text and still marks the
-execution an error, which is what rolls the state back.
-
-Returning the message instead would read the same and be wrong: the execution
-succeeds, so anything written before the return is kept. The one place this
-contract *does* return a refusal — compiled rules disagreeing with the examples
-— is deliberate and safe, because nothing has been written at that point and the
-caller needs the code back to see what went wrong.
-
-There is no payable method here, so the trap that costs money elsewhere on this
-chain — value sent with a refused payable call is not returned — does not arise.
+It is a much smaller avenue than it was. The worst a steered model can now do is
+choose a predicate from the catalogue with arguments the author did not intend —
+and that policy still has to satisfy the author's own examples, and is still
+published in full for anyone to read. There is no code to smuggle, because there
+is nowhere for code to go.

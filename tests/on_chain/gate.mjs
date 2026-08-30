@@ -8,7 +8,8 @@
  *
  *   npm i genlayer-js viem && node tests/on_chain/gate.mjs
  *
- * Set CODIFY below to a deployed Codify holding a rule set named "no-spam".
+ * Set the CODIFY environment variable to a deployed Codify holding a rule set
+ * named "no-spam", or edit the default below.
  */
 import { createClient, createAccount } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
@@ -18,7 +19,9 @@ const RPC="https://studio.genlayer.com/api";
 const rpc=async(m,p)=>{const r=await fetch(RPC,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method:m,params:p})});return (await r.json()).result;};
 let pass=0,fail=0;
 const ok=(n,c,d="")=>{c?pass++:fail++;console.log(`${c?"PASS":"FAIL"}  ${n}${d?"  — "+d:""}`);};
-const CODIFY="0x94B1488ad7448F193D1bb00225e2a1ae77870637";
+/* A Codify holding a rule set named "no-spam". Override it when you run this
+   against your own: CODIFY=0x… node tests/on_chain/gate.mjs */
+const CODIFY = process.env.CODIFY || "0x94B1488ad7448F193D1bb00225e2a1ae77870637";
 const acc=createAccount(generatePrivateKey());
 await rpc("sim_fundAccount",{account_address:acc.address,amount:300e18});
 const c=createClient({chain:studionet,account:acc}), rd=createClient({chain:studionet});

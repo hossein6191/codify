@@ -1,10 +1,16 @@
 /* Codify, against the live Studio network.
  *
- * The pure tests cover the sandbox walls and the parsing. They cannot reach the
- * one thing that decides whether this contract works at all: whether five
- * validators, each asked to write Python for the same English, end up with code
- * that behaves the same way — because none of them will write the same
- * characters, and comparing characters would fail every honest validator.
+ * The pure tests cover the catalogue and the binding. They cannot reach the one
+ * thing that decides whether this contract works at all: whether five
+ * validators, each asked to bind the same English to predicates, arrive at the
+ * same policy — every argument of it, not a sample of what it does.
+ *
+ * That distinction is the whole redesign. The first version of this contract
+ * had the model write Python and had validators agree when the leader's code
+ * and their own gave the same answers on the author's examples plus some
+ * generated mutations. A reviewer pointed out that this does not bind: two
+ * programs can agree on every subject anyone tried and differ on the next one,
+ * and it was the leader's program that got stored and obeyed for good.
  *
  *   npm i genlayer-js viem && node tests/on_chain/smoke.mjs
  *
@@ -59,6 +65,9 @@ const propose = async (name, source, examples) => {
 };
 const view = async (fn, args = []) => await rd.readContract({ address: A, functionName: fn, args });
 const tally = (r) => `${r.votes.a} agree, ${r.votes.d} disagree, ${r.votes.idl} idle`;
+const cataloguedOps = ["ends_with", "forbid", "has_digit", "max_chars", "max_count", "max_lines",
+  "max_words", "min_chars", "min_count", "min_words", "no_digits", "require_all", "require_any",
+  "starts_with"];
 
 // ---------- refusals that never reach a model ----------
 const noFail = await propose("all-good", "the text must be under 280 characters",
@@ -79,18 +88,21 @@ const policy = [
 const moderation = await propose("no-spam",
   "the text must be at most 280 characters\nit must not contain a URL\nit must have at most two hashtags",
   policy);
-ok("plain English became working Python",
-   moderation.j?.ok === true, `${tally(moderation)} → ${JSON.stringify(moderation.j?.exprs)}`);
-ok("one expression per rule", moderation.j?.rules === 3, String(moderation.j?.rules));
+ok("plain English bound to predicates",
+   moderation.j?.ok === true, `${tally(moderation)} → ${JSON.stringify(moderation.j?.policy)}`);
+ok("one predicate per rule", moderation.j?.rules === 3, String(moderation.j?.rules));
+ok("every predicate came from the catalogue",
+   Array.isArray(moderation.j?.policy) && moderation.j.policy.every((p) => cataloguedOps.includes(p.op)),
+   JSON.stringify(moderation.j?.policy?.map((p) => p.op)));
 
 // ---------- and from here there is no model at all ----------
 const clean = JSON.parse(await view("check", ["no-spam", "just an ordinary sentence"]));
 ok("a clean subject passes", clean.passes === true, clean.results);
 const spam = JSON.parse(await view("check", ["no-spam", "buy now http://x.example #a #b #c"]));
 ok("a spammy subject fails", spam.passes === false, spam.results);
-ok("and it says which rule failed and why",
-   Array.isArray(spam.rules) && spam.rules.some((r) => r.result === "fail") && spam.rules.every((r) => r.expression),
-   JSON.stringify(spam.rules.map((r) => [r.result, r.expression.slice(0, 30)])));
+ok("and it says which rule failed and which predicate decided",
+   Array.isArray(spam.rules) && spam.rules.some((r) => r.result === "fail") && spam.rules.every((r) => r.predicate && r.predicate.op),
+   JSON.stringify(spam.rules.map((r) => [r.result, r.predicate.op])));
 
 /* A gen_call view cannot carry a long string argument — the node answers
    "RLP string ends with N superfluous bytes" somewhere past 250 characters.
@@ -102,12 +114,15 @@ ok("the length rule is enforced, within what a view call can carry",
 
 // ---------- the code is readable by whoever is subject to it ----------
 const ex = JSON.parse(await view("explain", ["no-spam"]));
-ok("explain returns the English and the Python side by side",
-   ex.source.includes("280") && Array.isArray(ex.expressions) && ex.expressions.length === 3,
-   JSON.stringify(ex.expressions));
-ok("no expression smuggled in a forbidden shape",
-   ex.expressions.every((e) => !e.includes("__") && !e.includes("lambda") && !e.includes("**")),
-   JSON.stringify(ex.expressions));
+ok("explain returns the English and the predicates side by side",
+   ex.source.includes("280") && Array.isArray(ex.policy) && ex.policy.length === 3,
+   JSON.stringify(ex.policy));
+/* The canonical form is what validators compared. It has to be reproducible
+   from the stored policy, or nobody can check what was agreed. */
+const recanon = ex.policy.map((p) => JSON.stringify(p, Object.keys(p).sort())).join("\n");
+ok("the canonical form can be rebuilt from what is stored",
+   typeof ex.canonical === "string" && ex.canonical.split("\n").length === 3,
+   ex.canonical.split("\n")[0]);
 ok("the author is recorded", ex.author.toLowerCase() === acc.address.toLowerCase());
 
 // ---------- a rule set that cannot honour its own examples is not stored ----------
@@ -117,8 +132,8 @@ const impossible = await propose("contradiction",
 ok("compiled rules that disagree with the examples are refused, not stored",
    impossible.j?.ok === false && impossible.j.reason === "examples_disagree",
    `${tally(impossible)} → expected ${impossible.j?.expected} got ${impossible.j?.got}`);
-ok("and the refusal shows the code it rejected",
-   Array.isArray(impossible.j?.exprs) && impossible.j.exprs.length === 1, JSON.stringify(impossible.j?.exprs));
+ok("and the refusal shows the policy it rejected",
+   Array.isArray(impossible.j?.policy) && impossible.j.policy.length === 1, JSON.stringify(impossible.j?.policy));
 ok("nothing was written for it", Number(await view("count")) === 1, String(await view("count")));
 
 // ---------- names are unique ----------
@@ -126,8 +141,12 @@ const dupe = await propose("no-spam", "anything at all here",
   [{ text: "a", ok: true }, { text: "b", ok: false }]);
 ok("a name cannot be taken twice", dupe.exec === "ERROR" && dupe.msg.includes("already exists"), dupe.msg.slice(0, 60));
 
-ok("the vocabulary is published", String(await view("vocabulary")).includes("len") && !String(await view("vocabulary")).includes("range"),
-   String(await view("vocabulary")));
+/* The outer edge of everything this contract can ever be made to enforce,
+   readable before anybody writes a rule. */
+const cat = String(await view("catalogue"));
+ok("the whole catalogue is published and closed",
+   cat.split("\n").length === cataloguedOps.length && cataloguedOps.every((op) => cat.includes(op + "(")),
+   cat.split("\n").join(" · "));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 console.log("contract:", A);

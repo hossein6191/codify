@@ -1,12 +1,16 @@
 """The half of Codify that never asks anybody anything.
 
-Everything here runs the way it runs on chain: the same sandbox environment, the
-same T/F/E encoding, the same probe generation. What these cannot reach is
-whether validators agree on a compilation, which is what tests/on_chain.md is
-for.
+The most important test here is `TestBinding` — the one that shows why this
+contract stores a catalogue entry rather than a generated program. An earlier
+version had validators agree when the leader's code and their own produced the
+same answers on the author's examples plus some generated mutations. A reviewer
+pointed out that this does not bind: two programs can agree on every subject
+anyone tried and differ on the next one, and it was the leader's program that
+got stored and obeyed.
 
-The tests that matter most are the ones about what an expression is *not*
-allowed to reach, because that is the boundary between a rule engine and a hole.
+So the tests below check that the *whole policy* is pinned — every argument of
+it — and that anything the catalogue cannot express is refused rather than
+approximated.
 """
 
 import sys
@@ -62,215 +66,215 @@ import codify as cd  # noqa: E402
 import pytest  # noqa: E402
 
 
-class TestRunOne:
-    """T, F or E — and the difference between the last two is the whole point."""
+class TestBinding:
+    """A stored policy must have nothing left for a later input to expose.
 
-    def test_true(self):
-        assert cd._run_one("len(text) <= 10", "short") == "T"
-
-    def test_false(self):
-        assert cd._run_one("len(text) <= 3", "much longer") == "F"
-
-    def test_a_broken_expression_is_an_error_not_a_pass(self):
-        """A rule that cannot run must never read as satisfied.
-
-        If a broken expression came back False it would look like an ordinary
-        rejection; if it came back True it would wave everything through. It
-        gets its own letter so neither can happen quietly.
-        """
-        assert cd._run_one("len(text ==", "x") == "E"
-        assert cd._run_one("undefined_name > 1", "x") == "E"
-        assert cd._run_one("text.no_such_method()", "x") == "E"
-
-    def test_truthiness_is_forced_to_a_bool(self):
-        assert cd._run_one("text", "non-empty") == "T"
-        assert cd._run_one("text", "") == "F"
-        assert cd._run_one("len(text)", "abc") == "T"
-
-
-class TestSandboxWalls:
-    """What an expression cannot reach.
-
-    Nothing here is forbidden by a blocklist — the names simply are not present,
-    so reaching for one is a NameError. A blocklist is a list of the escapes
-    somebody thought of.
+    This is the property the previous design lacked, and it is the reason for
+    everything else in this file.
     """
 
-    @pytest.mark.parametrize("hostile", [
-        "__import__('os').listdir('/')",
-        "open('/etc/passwd').read()",
-        "eval('1+1')",
-        "exec('x=1')",
-        "globals()",
-        "locals()",
-        "vars()",
-        "getattr(text, 'upper')()",
-        "type(text)",
-        "dir(text)",
-        "compile('1','x','eval')",
-        "input()",
-        "print(text)",
-    ])
-    def test_is_not_reachable(self, hostile):
-        assert cd._run_one(hostile, "x") == "E"
+    def test_two_policies_that_agree_on_samples_still_differ_canonically(self):
+        """The exact failure the old design could not see.
 
-    def test_the_dunder_route_is_refused_before_it_ever_runs(self):
-        """`().__class__.__bases__` is the classic way out of a bare eval, and it
-        works: with builtins cut to the allowed list it still reaches 516
-        classes, Popen among them. Names were removed; the route through an
-        object's type never went through a name.
-
-        So it is stopped a step earlier, when the expression is read.
+        Both of these accept every subject up to 280 characters *in the samples
+        anyone would try*, and they are not the same rule. Under finite probe
+        equivalence they would have been recorded as agreeing; canonically they
+        plainly do not.
         """
-        escape = "().__class__.__bases__[0].__subclasses__()"
-        assert cd._run_one(escape, "x") in ("T", "F")   # eval alone does not stop it
+        a = cd._normalise({"op": "max_chars", "n": 280})
+        b = cd._normalise({"op": "max_chars", "n": 281})
+        samples = ["", "x" * 10, "x" * 200, "x" * 280]
+        assert all(cd._apply(a, s) == cd._apply(b, s) for s in samples)
+        assert cd._canon([a]) != cd._canon([b])
+
+    def test_the_one_subject_that_tells_them_apart(self):
+        a = cd._normalise({"op": "max_chars", "n": 280})
+        b = cd._normalise({"op": "max_chars", "n": 281})
+        assert cd._apply(a, "x" * 281) != cd._apply(b, "x" * 281)
+
+    def test_canonical_form_pins_every_argument(self):
+        base = {"op": "max_count", "of": "#", "n": 2, "ci": True}
+        for field, value in (("of", "@"), ("n", 3), ("ci", False)):
+            other = dict(base)
+            other[field] = value
+            assert cd._canon([cd._normalise(base)]) != cd._canon([cd._normalise(other)]), field
+
+    def test_the_same_policy_written_differently_is_the_same_policy(self):
+        """Two validators who listed the same strings in another order agree.
+
+        Sorting the list is what lets an honest disagreement about ordering stop
+        being a disagreement, without loosening anything about meaning.
+        """
+        one = cd._normalise({"op": "forbid", "any": ["https://", "http://"], "ci": True})
+        two = cd._normalise({"op": "forbid", "any": ["http://", "https://"], "ci": True})
+        assert cd._canon([one]) == cd._canon([two])
+
+    def test_a_duplicate_entry_does_not_change_the_policy(self):
+        one = cd._normalise({"op": "forbid", "any": ["http://", "http://"], "ci": True})
+        two = cd._normalise({"op": "forbid", "any": ["http://"], "ci": True})
+        assert cd._canon([one]) == cd._canon([two])
+
+    def test_order_of_rules_is_part_of_the_policy(self):
+        a = cd._normalise({"op": "max_chars", "n": 10})
+        b = cd._normalise({"op": "min_chars", "n": 2})
+        assert cd._canon([a, b]) != cd._canon([b, a])
+
+
+class TestCatalogueIsClosed:
+    """Nothing outside the table can ever be stored."""
+
+    def test_an_unknown_predicate_is_refused(self):
         with pytest.raises(Exception) as e:
-            cd._read_exprs({"expressions": [escape]}, 1)
-        assert "__" in str(e.value)
+            cd._normalise({"op": "run_python", "code": "1"})
+        assert cd.ERROR_MODEL in str(e.value)
 
-    @pytest.mark.parametrize("banned", [
-        "().__class__", "lambda x: x", "import os", "(y := 1)", "1; 2",
-    ])
-    def test_the_forbidden_shapes_are_refused(self, banned):
+    def test_an_argument_the_predicate_does_not_take_is_refused(self):
+        """Silently dropping it would be a difference two validators cannot see."""
+        with pytest.raises(Exception) as e:
+            cd._normalise({"op": "max_chars", "n": 10, "sneaky": "value"})
+        assert "does not take" in str(e.value)
+
+    def test_a_missing_argument_is_refused(self):
         with pytest.raises(Exception):
-            cd._read_exprs({"expressions": ["len(text) > 0 and " + banned]}, 1)
-
-    def test_range_is_not_in_the_vocabulary(self):
-        """Everything else iterates over `text`, which is capped."""
-        assert "range" not in cd._ALLOWED
-        assert cd._run_one("sum(1 for _ in range(1000))", "x") == "E"
-
-    @pytest.mark.parametrize("greedy", [
-        "len(text*100000000) > 0",
-        "len(text*10**8) > 0",
-        "len(str(99999999999)) > 0",
-    ])
-    def test_an_expression_cannot_ask_for_unbounded_work(self, greedy):
-        """The sandbox will not stop it, so this has to.
-
-        Measured on chain: spawn_sandbox ran a fifty million iteration loop to
-        completion and allocated a 300 MB string. It isolates state, not effort.
-        """
+            cd._normalise({"op": "max_chars"})
         with pytest.raises(Exception):
-            cd._read_exprs({"expressions": [greedy]}, 1)
+            cd._normalise({"op": "starts_with"})
 
-    def test_ordinary_numbers_still_pass(self):
-        for expr in ("len(text) <= 280", "text.count('#') <= 2", "len(text) > 9999"):
-            assert cd._read_exprs({"expressions": [expr]}, 1) == [expr]
+    def test_a_non_numeric_number_is_refused(self):
+        with pytest.raises(Exception):
+            cd._normalise({"op": "max_chars", "n": "many"})
 
-    def test_the_allowed_names_do_work(self):
-        for expr in ("len(text) > 0", "any(c.isdigit() for c in text)",
-                     "all(c != '@' for c in text)", "max(1, len(text)) > 0",
-                     "sum(1 for c in text if c == 'a') < 5",
-                     "sorted(set(text)) == sorted(set(text))"):
-            assert cd._run_one(expr, "abc123") in ("T", "F"), expr
+    def test_an_out_of_range_number_is_refused(self):
+        with pytest.raises(Exception):
+            cd._normalise({"op": "max_chars", "n": cd._MAX_N + 1})
+        with pytest.raises(Exception):
+            cd._normalise({"op": "max_chars", "n": -1})
 
-    def test_the_environment_holds_only_what_it_says(self):
-        env = cd._env("x")
-        assert set(env.keys()) == {"__builtins__", "text"}
-        assert set(env["__builtins__"].keys()) == set(cd._ALLOWED)
+    def test_an_overlong_string_is_refused(self):
+        with pytest.raises(Exception):
+            cd._normalise({"op": "starts_with", "s": "x" * (cd._MAX_NEEDLE + 1)})
 
-    def test_one_subject_cannot_leak_into_another(self):
-        """A fresh environment each time, so no expression can plant anything."""
-        cd._run_one("text", "first")
-        assert cd._env("second")["text"] == "second"
+    def test_an_empty_string_argument_is_refused(self):
+        with pytest.raises(Exception):
+            cd._normalise({"op": "starts_with", "s": ""})
 
+    def test_an_empty_or_huge_list_is_refused(self):
+        with pytest.raises(Exception):
+            cd._normalise({"op": "forbid", "any": []})
+        with pytest.raises(Exception):
+            cd._normalise({"op": "forbid", "any": ["a" + str(i) for i in range(cd._MAX_LIST + 1)]})
 
-class TestBehaviour:
-    def test_is_expression_major_within_each_subject(self):
-        exprs = ["len(text) > 0", "len(text) > 5"]
-        assert cd._behaviour(exprs, ["abc", "abcdefg"]) == "TF" + "TT"
+    def test_a_list_where_a_string_belongs_is_refused(self):
+        with pytest.raises(Exception):
+            cd._normalise({"op": "forbid", "any": "http://"})
 
-    def test_empty_inputs(self):
-        assert cd._behaviour([], ["a"]) == ""
-        assert cd._behaviour(["len(text)>0"], []) == ""
-
-    def test_carries_errors_through(self):
-        assert cd._behaviour(["len(text ==", "len(text) > 0"], ["a"]) == "ET"
-
-
-class TestProbeSubjects:
-    """The examples, plus mutations nobody chose.
-
-    A model writing an expression can see the examples. It cannot see these, and
-    an expression that only works on what it was shown comes apart here.
-    """
-
-    EXAMPLES = [{"text": "hello world", "ok": True}, {"text": "no", "ok": False}]
-
-    def test_keeps_every_example(self):
-        subjects = cd._probe_subjects(self.EXAMPLES)
-        assert "hello world" in subjects
-        assert "no" in subjects
-
-    def test_adds_the_edges(self):
-        subjects = cd._probe_subjects(self.EXAMPLES)
-        assert "" in subjects
-        assert "HELLO WORLD" in subjects
-        assert "hello world hello world" in subjects
-
-    def test_a_length_rule_overfitted_to_the_examples_is_exposed(self):
-        """Both rules agree on the examples; only the probes tell them apart."""
-        honest = "len(text) <= 11"
-        overfit = "text in ('hello world', 'no')"
-        examples = [e["text"] for e in self.EXAMPLES]
-        assert cd._behaviour([honest], examples) == cd._behaviour([overfit], examples)
-        probes = cd._probe_subjects(self.EXAMPLES)
-        assert cd._behaviour([honest], probes) != cd._behaviour([overfit], probes)
-
-    def test_no_examples_means_no_probes(self):
-        assert cd._probe_subjects([]) == []
+    def test_every_catalogue_entry_has_an_implementation(self):
+        for op in cd._CATALOGUE:
+            spec = cd._CATALOGUE[op]
+            rule = {"op": op}
+            for key in spec["ints"]:
+                rule[key] = 1
+            for key in spec["texts"]:
+                rule[key] = "x"
+            for key in spec["lists"]:
+                rule[key] = ["x"]
+            assert isinstance(cd._apply(cd._normalise(rule), "x sample 1"), bool), op
 
 
-class TestReadExprs:
+class TestPredicates:
+    def n(self, **kw):
+        return cd._normalise(kw)
+
+    def test_lengths(self):
+        assert cd._apply(self.n(op="max_chars", n=5), "abc")
+        assert not cd._apply(self.n(op="max_chars", n=2), "abc")
+        assert cd._apply(self.n(op="min_chars", n=3), "abc")
+        assert not cd._apply(self.n(op="min_chars", n=4), "abc")
+
+    def test_words_and_lines(self):
+        assert cd._apply(self.n(op="max_words", n=3), "one two three")
+        assert not cd._apply(self.n(op="max_words", n=2), "one two three")
+        assert cd._apply(self.n(op="min_words", n=2), "one two")
+        assert cd._apply(self.n(op="max_lines", n=2), "a\nb")
+        assert not cd._apply(self.n(op="max_lines", n=1), "a\nb")
+
+    def test_forbid_is_case_insensitive_by_default(self):
+        rule = self.n(op="forbid", any=["http://"])
+        assert rule["ci"] is True
+        assert not cd._apply(rule, "see HTTP://x.com")
+        assert cd._apply(rule, "nothing here")
+
+    def test_forbid_can_be_made_exact(self):
+        rule = self.n(op="forbid", any=["http://"], ci=False)
+        assert cd._apply(rule, "see HTTP://x.com")
+
+    def test_require_all_and_any(self):
+        every = self.n(op="require_all", all=["signed", "off"])
+        assert cd._apply(every, "signed and off")
+        assert not cd._apply(every, "signed only")
+        some = self.n(op="require_any", any=["fix", "feat"])
+        assert cd._apply(some, "feat: something")
+        assert not cd._apply(some, "chore: something")
+
+    def test_counting(self):
+        assert cd._apply(self.n(op="max_count", of="#", n=2), "#a #b")
+        assert not cd._apply(self.n(op="max_count", of="#", n=2), "#a #b #c")
+        assert cd._apply(self.n(op="min_count", of="@", n=1), "hi @you")
+
+    def test_edges(self):
+        assert cd._apply(self.n(op="starts_with", s="RFC:"), "rfc: hello")      # ci defaults on
+        assert not cd._apply(self.n(op="starts_with", s="RFC:", ci=False), "rfc: hello")
+        assert cd._apply(self.n(op="ends_with", s="."), "a sentence.")
+
+    def test_digits(self):
+        assert cd._apply(self.n(op="no_digits"), "no numbers here")
+        assert not cd._apply(self.n(op="no_digits"), "room 101")
+        assert cd._apply(self.n(op="has_digit"), "room 101")
+
+    def test_the_empty_subject(self):
+        """Nothing should raise on it, whatever the answer is."""
+        for op in cd._CATALOGUE:
+            spec = cd._CATALOGUE[op]
+            rule = {"op": op}
+            for key in spec["ints"]:
+                rule[key] = 1
+            for key in spec["texts"]:
+                rule[key] = "x"
+            for key in spec["lists"]:
+                rule[key] = ["x"]
+            assert isinstance(cd._apply(cd._normalise(rule), ""), bool), op
+
+
+class TestVerdicts:
+    def test_string_of_letters(self):
+        policy = [cd._normalise({"op": "max_chars", "n": 10}),
+                  cd._normalise({"op": "no_digits"})]
+        assert cd._verdicts(policy, "abc") == "TT"
+        assert cd._verdicts(policy, "abc123") == "TF"
+        assert cd._verdicts(policy, "a very long subject 123") == "FF"
+
+
+class TestReadRules:
     def test_plain(self):
-        got = cd._read_exprs({"expressions": ["len(text) < 10", "'@' in text"]}, 2)
-        assert got == ["len(text) < 10", "'@' in text"]
+        got = cd._read_rules({"rules": [{"op": "max_chars", "n": 280}]}, 1)
+        assert got == [{"op": "max_chars", "n": 280}]
 
-    @pytest.mark.parametrize("key", ["exprs", "rules", "checks"])
+    @pytest.mark.parametrize("key", ["predicates", "policy", "checks"])
     def test_accepts_the_names_models_reach_for(self, key):
-        assert cd._read_exprs({key: ["len(text) < 10"]}, 1) == ["len(text) < 10"]
-
-    def test_accepts_objects_instead_of_strings(self):
-        got = cd._read_exprs({"expressions": [{"rule": "short", "expression": "len(text) < 10"}]}, 1)
-        assert got == ["len(text) < 10"]
-
-    def test_strips_a_code_fence(self):
-        assert cd._read_exprs({"expressions": ["`len(text) < 10`"]}, 1) == ["len(text) < 10"]
+        assert cd._read_rules({key: [{"op": "no_digits"}]}, 1) == [{"op": "no_digits"}]
 
     def test_digs_json_out_of_chatter(self):
-        raw = 'Here you go:\n{"expressions": ["len(text) < 10"]}\nHope that helps!'
-        assert cd._read_exprs(raw, 1) == ["len(text) < 10"]
+        raw = 'Sure:\n{"rules": [{"op": "max_chars", "n": 10}]}\nhope that helps'
+        assert cd._read_rules(raw, 1)[0]["n"] == 10
 
     def test_refuses_the_wrong_count(self):
         with pytest.raises(Exception) as e:
-            cd._read_exprs({"expressions": ["len(text) < 10"]}, 2)
+            cd._read_rules({"rules": [{"op": "no_digits"}]}, 2)
         assert cd.ERROR_MODEL in str(e.value)
-
-    def test_refuses_a_multi_line_expression(self):
-        with pytest.raises(Exception):
-            cd._read_exprs({"expressions": ["x = 1\nlen(text)"]}, 1)
-
-    def test_refuses_an_overlong_expression(self):
-        with pytest.raises(Exception):
-            cd._read_exprs({"expressions": ["x" * (cd._MAX_EXPR + 1)]}, 1)
-
-    def test_refuses_an_empty_expression(self):
-        with pytest.raises(Exception):
-            cd._read_exprs({"expressions": ["   "]}, 1)
 
     def test_refuses_a_non_object(self):
         with pytest.raises(Exception):
-            cd._read_exprs("no json here at all", 1)
-
-
-class TestLines:
-    def test_drops_blanks_and_trims(self):
-        assert cd._lines("  a  \n\n  b\n \n c ") == ["a", "b", "c"]
-
-    def test_empty(self):
-        assert cd._lines("") == []
-        assert cd._lines("\n\n  \n") == []
+            cd._read_rules("no json at all", 1)
 
 
 class TestRequire:
@@ -282,34 +286,28 @@ class TestRequire:
 
 
 class TestARealRuleSet:
-    """End to end over the deterministic half: a plausible moderation policy."""
+    """A plausible moderation policy, end to end over the deterministic half."""
 
-    EXPRS = ["len(text) <= 280", "'http' not in text", "text.count('#') <= 2"]
+    POLICY = [
+        {"op": "max_chars", "n": 280},
+        {"op": "forbid", "any": ["http://", "https://"], "ci": True},
+        {"op": "max_count", "of": "#", "n": 2, "ci": True},
+    ]
     EXAMPLES = [
-        {"text": "a normal post #one #two", "ok": True},
-        {"text": "spam http://x.com", "ok": False},
+        {"text": "a normal post with #one #two", "ok": True},
+        {"text": "spam http://x.example", "ok": False},
         {"text": "#a #b #c #d", "ok": False},
     ]
 
-    def test_the_examples_come_out_as_the_author_said(self):
-        got = "".join(
-            "T" if all(cd._run_one(e, ex["text"]) == "T" for e in self.EXPRS) else "F"
-            for ex in self.EXAMPLES)
-        want = "".join("T" if ex["ok"] else "F" for ex in self.EXAMPLES)
+    def test_it_agrees_with_its_examples(self):
+        policy = [cd._normalise(r) for r in self.POLICY]
+        got = "".join("T" if all(cd._apply(r, e["text"]) for r in policy) else "F"
+                      for e in self.EXAMPLES)
+        want = "".join("T" if e["ok"] else "F" for e in self.EXAMPLES)
         assert got == want
 
-    def test_behaviour_is_stable_across_runs(self):
-        probes = cd._probe_subjects(self.EXAMPLES)
-        assert cd._behaviour(self.EXPRS, probes) == cd._behaviour(self.EXPRS, probes)
-
-    def test_a_differently_written_but_equivalent_rule_set_matches(self):
-        """What validators compare is behaviour, not characters.
-
-        Two people writing the same policy in Python do not write the same
-        string, and a contract that demanded they did would reject every honest
-        validator it ever had.
-        """
-        other = ["not len(text) > 280", "text.find('http') == -1",
-                 "len([c for c in text if c == '#']) < 3"]
-        probes = cd._probe_subjects(self.EXAMPLES)
-        assert cd._behaviour(other, probes) == cd._behaviour(self.EXPRS, probes)
+    def test_the_canonical_form_is_stable_and_reloadable(self):
+        policy = [cd._normalise(r) for r in self.POLICY]
+        text = cd._canon(policy)
+        assert text == cd._canon(policy)
+        assert [json.loads(l) for l in text.split("\n")] == policy

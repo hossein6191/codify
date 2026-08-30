@@ -3,18 +3,39 @@
 
 """Codify: write the rule in English once, enforce it in code forever.
 
-A model is asked to turn plain-language rules into Python expressions. The
-expressions are run, on chain and deterministically, against examples the author
-supplied — and if they disagree with the author about a single example, the
-whole rule set is refused. What is stored is the code, in the open, so anyone
-subject to a rule can read exactly what they are subject to.
+A model reads plain-language rules and chooses, for each one, a predicate from a
+closed catalogue and the arguments to fill it. Validators compare the resulting
+policy in canonical form, exactly. Then the policy is run against the author's
+own examples, and if it disagrees with them about a single one, nothing is
+stored.
 
-After that the model is never called again. `check` is arithmetic: free,
-instant, and identical for everybody who ever runs it.
+After that the model is never called again. `check` walks the stored predicates
+in ordinary code: free, deterministic, and identical for everybody who ever runs
+it.
 
-The point is the inversion. Most contracts that use a model put it in the way of
-every decision, so every decision carries its cost and its uncertainty. This one
-pays for the model once, to be rid of it.
+Why a catalogue rather than generated code
+------------------------------------------
+An earlier version of this contract asked the model for arbitrary Python and had
+validators agree when the leader's expressions and their own produced the same
+results on the author's examples plus some generated mutations. That is finite
+probe equivalence, and it does not bind. Two expressions can agree on every
+subject anyone thought to try and part company on the next one — and it was the
+*leader's* expression that got stored and that every later `check`, and every
+downstream contract reading it, would obey. The validators had approved a sample
+of a program's behaviour and inherited all of it.
+
+A closed catalogue removes the gap instead of narrowing it. `{"op":"max_chars",
+"n":280}` has exactly one meaning, so two validators either chose the same
+policy or they did not, and comparing them is string equality over a canonical
+form rather than a guess about the future. There is no input, ever, on which the
+stored policy can surprise the validators who approved it.
+
+It also means no `eval`, no sandbox and no generated code anywhere: the contract
+executes the predicates itself.
+
+The cost is expressiveness. Only rules the catalogue can express can be written,
+and one it cannot is refused outright. For a contract whose output governs money
+and access, refusing what it cannot represent is the right failure.
 """
 
 import datetime
@@ -25,58 +46,50 @@ from genlayer import *
 
 # Error classes, so a validator can tell a rule of this contract from a model
 # having a bad day. The first must match exactly; the second is not something to
-# agree about, because agreeing would record an answer nobody produced.
+# agree about, because agreeing would record a policy nobody produced.
 ERROR_EXPECTED = "[EXPECTED]"
 ERROR_MODEL = "[MODEL]"
 
 _MAX_NAME = 48
-_MAX_SOURCE = 1000       # characters of English
+_MAX_SOURCE = 1000        # characters of English
 _MAX_RULES = 8
-_MAX_EXPR = 240          # characters of Python, per rule
 _MAX_EXAMPLES = 8
-_MAX_SUBJECT = 2000      # characters of text a rule may be applied to
+_MAX_SUBJECT = 2000       # characters of text a rule may be applied to
+_MAX_NEEDLE = 80          # characters in any string argument
+_MAX_LIST = 8             # entries in a list argument
+_MAX_N = 100000           # the largest number any predicate will accept
 
-# The only names an expression may use. Everything else - imports, attributes on
-# builtins, dunder anything - is absent rather than forbidden, so an expression
-# that reaches for them raises NameError inside the sandbox and reads as a
-# broken rule rather than as an escape. Measured on chain: `__import__('os')`
-# comes back as NameError, which is the failure mode this wants.
-_SAFE = {
-    "len": len, "any": any, "all": all, "sum": sum, "min": min, "max": max,
-    "abs": abs, "str": str, "int": int, "float": float, "bool": bool,
-    "sorted": sorted, "set": set, "list": list, "enumerate": enumerate,
+# The catalogue. Each entry names the arguments a predicate takes, and nothing
+# outside this table can ever be stored. A reader can hold the entire vocabulary
+# of every policy this contract will ever enforce in their head.
+#
+#   ints    the integer arguments, required
+#   texts   the single-string arguments, required
+#   lists   the string-list arguments, required
+#   ci      whether the predicate accepts a case-insensitive flag
+_CATALOGUE = {
+    "max_chars":   {"ints": ("n",), "texts": (), "lists": (), "ci": False},
+    "min_chars":   {"ints": ("n",), "texts": (), "lists": (), "ci": False},
+    "max_words":   {"ints": ("n",), "texts": (), "lists": (), "ci": False},
+    "min_words":   {"ints": ("n",), "texts": (), "lists": (), "ci": False},
+    "max_lines":   {"ints": ("n",), "texts": (), "lists": (), "ci": False},
+    "forbid":      {"ints": (), "texts": (), "lists": ("any",), "ci": True},
+    "require_all": {"ints": (), "texts": (), "lists": ("all",), "ci": True},
+    "require_any": {"ints": (), "texts": (), "lists": ("any",), "ci": True},
+    "max_count":   {"ints": ("n",), "texts": ("of",), "lists": (), "ci": True},
+    "min_count":   {"ints": ("n",), "texts": ("of",), "lists": (), "ci": True},
+    "starts_with": {"ints": (), "texts": ("s",), "lists": (), "ci": True},
+    "ends_with":   {"ints": (), "texts": ("s",), "lists": (), "ci": True},
+    "no_digits":   {"ints": (), "texts": (), "lists": (), "ci": False},
+    "has_digit":   {"ints": (), "texts": (), "lists": (), "ci": False},
 }
-_ALLOWED = tuple(sorted(_SAFE.keys()))
-
-# `range` is deliberately absent. Every other name here iterates over `text`,
-# which is capped, so the work an expression can do is bounded by its subject.
-# `range` is the one that lets a single short expression ask for an unbounded
-# amount of it.
-#
-# And a restricted `eval` is not a sandbox. Measured: with builtins cut down to
-# the list above, `().__class__.__bases__[0].__subclasses__()` still reaches 516
-# classes, `Popen` and `BuiltinImporter` among them. The names were removed; the
-# route through an object's type was not, because it never goes through a name.
-# So expressions are refused outright if they contain a double underscore, which
-# is what every version of that escape needs and no honest rule about a piece of
-# text has ever wanted.
-#
-# The sandbox does not bound the work either. Measured: `spawn_sandbox` ran
-# `sum(1 for _ in range(50_000_000))` to completion in 63 seconds and allocated
-# a 300 MB string without complaint. It isolates state; it does not stop an
-# expression from taking as long as it likes. So the bound has to be here.
-# Without `range`, iteration is over `text`, which is capped. Without `**` and
-# without long numeric literals, a repetition cannot ask for more than a subject
-# times 9999.
-_FORBIDDEN = ("__", "lambda", "import", ":=", ";", "**")
-_MAX_LITERAL_DIGITS = 4   # 9999, comfortably past a subject capped at 2000
 
 
 def _require(condition: bool, message: str) -> None:
     """Refuse with a reason the caller can read.
 
     A failed `assert` reaches the explorer as `exit_code 1` with the reason
-    gone, which tells somebody whose rule set was refused nothing at all.
+    thrown away, which tells somebody whose rule set was refused nothing at all.
     """
     if not condition:
         raise gl.vm.UserError(ERROR_EXPECTED + " " + message)
@@ -91,65 +104,146 @@ def _lines(text: str) -> list:
     return out
 
 
-def _env(subject: str) -> dict:
-    """The whole world an expression gets to see.
+def _normalise(rule) -> dict:
+    """Turn one thing the model returned into a catalogue entry, or refuse it.
 
-    A fresh dict every call, so nothing an expression does can outlive it or
-    reach the next subject.
+    Strict on purpose. Every field is checked against the catalogue and anything
+    unrecognised is an error rather than something silently dropped, because a
+    field that is quietly ignored is a difference between two validators that
+    neither of them can see.
     """
-    return {"__builtins__": dict(_SAFE), "text": subject}
+    if not isinstance(rule, dict):
+        raise gl.vm.UserError(ERROR_MODEL + " a rule came back as something other than an object")
+    op = str(rule.get("op", "")).strip().lower()
+    if op not in _CATALOGUE:
+        raise gl.vm.UserError(ERROR_MODEL + " unknown predicate '" + op[:30]
+                              + "'; the catalogue is " + ", ".join(sorted(_CATALOGUE.keys())))
+    spec = _CATALOGUE[op]
+    out = {"op": op}
+
+    for key in spec["ints"]:
+        if key not in rule:
+            raise gl.vm.UserError(ERROR_MODEL + " " + op + " needs '" + key + "'")
+        try:
+            value = int(str(rule[key]).strip())
+        except Exception:
+            raise gl.vm.UserError(ERROR_MODEL + " " + op + "'s '" + key + "' is not a whole number")
+        if not 0 <= value <= _MAX_N:
+            raise gl.vm.UserError(ERROR_MODEL + " " + op + "'s '" + key + "' is out of range")
+        out[key] = value
+
+    for key in spec["texts"]:
+        if key not in rule:
+            raise gl.vm.UserError(ERROR_MODEL + " " + op + " needs '" + key + "'")
+        value = str(rule[key])
+        if not 1 <= len(value) <= _MAX_NEEDLE:
+            raise gl.vm.UserError(ERROR_MODEL + " " + op + "'s '" + key + "' must be 1 to "
+                                  + str(_MAX_NEEDLE) + " characters")
+        out[key] = value
+
+    for key in spec["lists"]:
+        if key not in rule or not isinstance(rule[key], list):
+            raise gl.vm.UserError(ERROR_MODEL + " " + op + " needs '" + key + "' as a list")
+        items = []
+        for item in rule[key]:
+            value = str(item)
+            if not 1 <= len(value) <= _MAX_NEEDLE:
+                raise gl.vm.UserError(ERROR_MODEL + " an entry in " + op + "'s '" + key
+                                      + "' must be 1 to " + str(_MAX_NEEDLE) + " characters")
+            if value not in items:
+                items.append(value)
+        if not 1 <= len(items) <= _MAX_LIST:
+            raise gl.vm.UserError(ERROR_MODEL + " " + op + "'s '" + key + "' must hold 1 to "
+                                  + str(_MAX_LIST) + " entries")
+        # Sorted, so two validators that listed the same strings in a different
+        # order have written the same policy and are recorded as agreeing.
+        items.sort()
+        out[key] = items
+
+    if spec["ci"]:
+        out["ci"] = bool(rule.get("ci", True))
+
+    known = set(out.keys())
+    for key in rule:
+        if str(key) not in known:
+            raise gl.vm.UserError(ERROR_MODEL + " " + op + " was given an argument it does not take: "
+                                  + str(key)[:24])
+    return out
 
 
-def _run_one(expr: str, subject: str) -> str:
-    """One expression against one subject: "T", "F", or "E".
+def _canon(rules: list) -> str:
+    """The whole policy, in one form, with nothing left to interpretation.
 
-    An expression that raises is an "E" rather than a False. The difference
-    matters: a rule that cannot run is broken, and a broken rule must not be
-    allowed to quietly pass everything it is shown.
+    This is what validators compare. Not a sample of what the policy does — the
+    policy itself, every argument of it, in an order that cannot vary.
     """
-    try:
-        return "T" if bool(eval(expr, _env(subject))) else "F"
-    except Exception:
-        return "E"
+    return "\n".join(json.dumps(r, sort_keys=True, separators=(",", ":")) for r in rules)
 
 
-def _behaviour(exprs: list, subjects: list) -> str:
-    """How a whole rule set behaves across a whole list of subjects.
+def _apply(rule: dict, subject: str) -> bool:
+    """One predicate against one subject. Ordinary code, no eval anywhere."""
+    op = rule["op"]
+    fold = rule.get("ci", False)
+    hay = subject.lower() if fold else subject
 
-    Flattened to one string on purpose. This is what validators compare, and a
-    string of T, F and E is the smallest thing that still says everything about
-    what a rule set does.
-    """
-    out = []
-    for subject in subjects:
-        for expr in exprs:
-            out.append(_run_one(expr, subject))
-    return "".join(out)
+    if op == "max_chars":
+        return len(subject) <= rule["n"]
+    if op == "min_chars":
+        return len(subject) >= rule["n"]
+    if op == "max_words":
+        return len(subject.split()) <= rule["n"]
+    if op == "min_words":
+        return len(subject.split()) >= rule["n"]
+    if op == "max_lines":
+        return len(subject.split("\n")) <= rule["n"]
+    if op == "no_digits":
+        for ch in subject:
+            if ch.isdigit():
+                return False
+        return True
+    if op == "has_digit":
+        for ch in subject:
+            if ch.isdigit():
+                return True
+        return False
+    if op == "starts_with":
+        needle = rule["s"].lower() if fold else rule["s"]
+        return hay.startswith(needle)
+    if op == "ends_with":
+        needle = rule["s"].lower() if fold else rule["s"]
+        return hay.endswith(needle)
+    if op == "max_count":
+        needle = rule["of"].lower() if fold else rule["of"]
+        return hay.count(needle) <= rule["n"]
+    if op == "min_count":
+        needle = rule["of"].lower() if fold else rule["of"]
+        return hay.count(needle) >= rule["n"]
+    if op == "forbid":
+        for item in rule["any"]:
+            if (item.lower() if fold else item) in hay:
+                return False
+        return True
+    if op == "require_all":
+        for item in rule["all"]:
+            if (item.lower() if fold else item) not in hay:
+                return False
+        return True
+    if op == "require_any":
+        for item in rule["any"]:
+            if (item.lower() if fold else item) in hay:
+                return True
+        return False
+    # Unreachable: _normalise refuses anything not in the catalogue, and the
+    # catalogue and this function are the two halves of the same table.
+    raise gl.vm.UserError(ERROR_EXPECTED + " no implementation for predicate " + op)
 
 
-def _probe_subjects(examples: list) -> list:
-    """The author's examples, plus edge cases the author did not choose.
-
-    An expression can satisfy every example it was shown and still be wrong,
-    because the model saw those examples while it was writing. These mutations
-    are generated by code from the examples themselves, so nobody — not the
-    author, not the model — picked them, and an expression that only works on
-    what it was shown falls apart here.
-    """
-    subjects = []
-    for example in examples:
-        subjects.append(example["text"])
-    if examples:
-        first = examples[0]["text"]
-        subjects.append("")
-        subjects.append(first[:max(1, len(first) // 2)])
-        subjects.append(first + " " + first)
-        subjects.append(first.upper())
-    return subjects
+def _verdicts(rules: list, subject: str) -> str:
+    return "".join("T" if _apply(r, subject) else "F" for r in rules)
 
 
-def _read_exprs(raw, wanted: int) -> list:
-    """Pull the expressions out of whatever the model returned."""
+def _read_rules(raw, wanted: int) -> list:
+    """Pull the policy out of whatever the model returned, and bind every field."""
     data = raw if isinstance(raw, dict) else None
     if data is None:
         text = str(raw).strip()
@@ -164,47 +258,17 @@ def _read_exprs(raw, wanted: int) -> list:
                 data = None
     if not isinstance(data, dict):
         raise gl.vm.UserError(ERROR_MODEL + " the model did not return an object")
-    raw_list = None
-    for key in ("expressions", "exprs", "rules", "checks"):
+    listed = None
+    for key in ("rules", "predicates", "policy", "checks"):
         if key in data and isinstance(data[key], list):
-            raw_list = data[key]
+            listed = data[key]
             break
-    if raw_list is None:
-        raise gl.vm.UserError(ERROR_MODEL + " the model returned no expression list")
-    exprs = []
-    for item in raw_list:
-        if isinstance(item, dict):
-            value = None
-            for key in ("expression", "expr", "code", "python"):
-                if key in item and item[key] is not None:
-                    value = item[key]
-                    break
-            item = value
-        if item is None:
-            raise gl.vm.UserError(ERROR_MODEL + " one rule came back without an expression")
-        expr = str(item).strip()
-        if expr.startswith("`"):
-            expr = expr.strip("`").strip()
-        if len(expr) == 0 or len(expr) > _MAX_EXPR:
-            raise gl.vm.UserError(ERROR_MODEL + " an expression was empty or longer than "
-                                  + str(_MAX_EXPR) + " characters")
-        if "\n" in expr:
-            raise gl.vm.UserError(ERROR_MODEL + " an expression spanned more than one line")
-        for banned in _FORBIDDEN:
-            if banned in expr:
-                raise gl.vm.UserError(ERROR_MODEL + " an expression contained '" + banned
-                                      + "', which is refused: " + expr[:60])
-        run = 0
-        for ch in expr:
-            run = run + 1 if ch.isdigit() else 0
-            if run > _MAX_LITERAL_DIGITS:
-                raise gl.vm.UserError(ERROR_MODEL + " an expression used a number longer than "
-                                      + str(_MAX_LITERAL_DIGITS) + " digits: " + expr[:60])
-        exprs.append(expr)
-    if len(exprs) != wanted:
-        raise gl.vm.UserError(ERROR_MODEL + " the model returned " + str(len(exprs))
-                              + " expressions for " + str(wanted) + " rules")
-    return exprs
+    if listed is None:
+        raise gl.vm.UserError(ERROR_MODEL + " the model returned no rule list")
+    if len(listed) != wanted:
+        raise gl.vm.UserError(ERROR_MODEL + " the model returned " + str(len(listed))
+                              + " predicates for " + str(wanted) + " rules")
+    return [_normalise(item) for item in listed]
 
 
 @allow_storage
@@ -213,14 +277,13 @@ class RuleSet:
     name: str
     author: Address
     source: str         # the English, as written
-    exprs: str          # the Python, one expression per line
+    policy: str         # the canonical predicates, one JSON object per line
     examples: str       # the JSON the author supplied
-    behaviour: str      # what the accepted expressions did on the probe subjects
     at: u64
 
 
 class Codify(gl.Contract):
-    """Named rule sets, compiled once and enforced by code thereafter."""
+    """Named rule sets, bound once and enforced by code thereafter."""
 
     sets: DynArray[RuleSet]
     by_name: TreeMap[str, u32]
@@ -234,15 +297,18 @@ class Codify(gl.Contract):
         _require(name in self.by_name, "no rule set named " + name)
         return int(self.by_name[name])
 
+    def _policy(self, index: int) -> list:
+        return [json.loads(line) for line in self.sets[index].policy.split("\n") if line]
+
     # ---------- writes ----------
 
     @gl.public.write
     def propose(self, name: str, source: str, examples_json: str) -> str:
-        """Compile English rules into expressions, and keep them only if they hold.
+        """Bind English rules to predicates, and keep them only if they hold.
 
-        The examples are the specification. A rule set that disagrees with its
+        The examples are the specification. A policy that disagrees with its
         author about one of them is refused outright, because the alternative is
-        storing code that nobody has checked against anything.
+        storing a rule nobody has checked against anything.
         """
         _require(1 <= len(name) <= _MAX_NAME, "the name must be 1 to " + str(_MAX_NAME) + " characters")
         _require(name not in self.by_name, "a rule set named " + name + " already exists")
@@ -256,8 +322,7 @@ class Codify(gl.Contract):
             _require(False, "the examples must be a JSON array")
             parsed = []
         _require(isinstance(parsed, list), "the examples must be a JSON array")
-        _require(2 <= len(parsed) <= _MAX_EXAMPLES,
-                 "give 2 to " + str(_MAX_EXAMPLES) + " examples")
+        _require(2 <= len(parsed) <= _MAX_EXAMPLES, "give 2 to " + str(_MAX_EXAMPLES) + " examples")
 
         examples = []
         passing = 0
@@ -274,41 +339,45 @@ class Codify(gl.Contract):
                 passing = passing + 1
             else:
                 failing = failing + 1
-        # A rule set that has never been shown something it should reject has
-        # not been specified, only described.
+        # A rule set that has never been shown something it should reject has not
+        # been specified, only described.
         _require(passing >= 1 and failing >= 1,
                  "give at least one example that should pass and one that should fail")
 
-        subjects = _probe_subjects(examples)
         wanted = len(rules)
         listing = "\n".join(str(i) + ". " + rules[i] for i in range(wanted))
-        allowed = ", ".join(_ALLOWED)
+        catalogue = json.dumps({
+            "max_chars": {"n": "int"}, "min_chars": {"n": "int"},
+            "max_words": {"n": "int"}, "min_words": {"n": "int"},
+            "max_lines": {"n": "int"},
+            "forbid": {"any": ["string"], "ci": "bool"},
+            "require_all": {"all": ["string"], "ci": "bool"},
+            "require_any": {"any": ["string"], "ci": "bool"},
+            "max_count": {"of": "string", "n": "int", "ci": "bool"},
+            "min_count": {"of": "string", "n": "int", "ci": "bool"},
+            "starts_with": {"s": "string", "ci": "bool"},
+            "ends_with": {"s": "string", "ci": "bool"},
+            "no_digits": {}, "has_digit": {},
+        }, sort_keys=True)
 
         def leader_fn():
-            def compile_rules():
+            def bind():
                 prompt = (
-                    "Turn each rule into ONE Python expression that evaluates to True when the "
-                    "rule is satisfied.\n\n"
+                    "Bind each rule to exactly one predicate from this catalogue, filling in its "
+                    "arguments. The subject the predicate is applied to is a piece of text.\n\n"
+                    "CATALOGUE (predicate: its arguments):\n" + catalogue + "\n\n"
                     "RULES:\n" + listing + "\n\n"
-                    "The subject is a string in a variable named `text`. You may use only these "
-                    "builtins: " + allowed + ". No imports, no statements, no assignments, no "
-                    "lambdas, no comprehensions over anything but `text`. One line each, and it "
-                    "must be an expression, not a function.\n\n"
+                    "Return one predicate per rule, in the same order. Use no predicate that is "
+                    "not in the catalogue and no argument a predicate does not take. If a rule "
+                    "cannot be expressed with exactly one of these, return it anyway using the "
+                    "closest predicate — a wrong binding will be caught by the author's examples "
+                    "and refused, which is better than an invented one.\n\n"
                     "Return ONLY this JSON:\n"
-                    "{\"expressions\": [\"<expression for rule 0>\", \"<expression for rule 1>\", ...]}"
+                    "{\"rules\": [{\"op\": \"...\", ...}, ...]}"
                 )
                 answer = gl.nondet.exec_prompt(prompt, response_format="json")
-                exprs = _read_exprs(answer, wanted)
-
-                # Everything from here down is arithmetic, and it is the whole
-                # reason this contract can be trusted: the model's work is put
-                # to the examples and either survives them or does not.
-                def measure():
-                    return _behaviour(exprs, subjects)
-
-                behaviour = str(gl.vm.unpack_result(gl.vm.spawn_sandbox(measure)))
-                return {"exprs": "\n".join(exprs), "behaviour": behaviour}
-            return compile_rules()
+                return {"policy": _canon(_read_rules(answer, wanted))}
+            return bind()
 
         def validator_fn(leaders_res) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
@@ -327,34 +396,21 @@ class Codify(gl.Contract):
                 mine = leader_fn()
             except Exception:
                 return False
-            # Not a comparison of the code. Two people writing the same rule in
-            # Python will not write the same characters, and demanding that they
-            # do would fail every honest validator. What has to match is what
-            # the code DOES, on subjects neither the author nor the model chose.
-            theirs = str(leaders_res.calldata.get("exprs", "")).split("\n")
+            # The whole policy, canonically, exactly. Not a sample of what it
+            # does on subjects somebody thought of — every predicate and every
+            # argument of the thing that will be stored and obeyed. There is no
+            # later input on which the stored policy can differ from what this
+            # validator approved, because this validator approved all of it.
+            return str(mine.get("policy")) == str(leaders_res.calldata.get("policy"))
 
-            def cross():
-                return _behaviour(theirs, subjects)
+        bound = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        policy_text = str(bound.get("policy", ""))
+        policy = [json.loads(line) for line in policy_text.split("\n") if line]
 
-            leader_behaviour = str(gl.vm.unpack_result(gl.vm.spawn_sandbox(cross)))
-            return leader_behaviour == str(mine.get("behaviour"))
-
-        compiled = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
-        exprs = str(compiled.get("exprs", "")).split("\n")
-        behaviour = str(compiled.get("behaviour", ""))
-
-        # The deterministic gate. Consensus said what the code does; this says
-        # whether that is what the author asked for, and it is decided here in
-        # ordinary code rather than by anybody's opinion.
-        def verdicts():
-            out = []
-            for example in examples:
-                results = [_run_one(expr, example["text"]) for expr in exprs]
-                out.append("T" if all(r == "T" for r in results) else "F")
-            return "".join(out)
-
-        got = str(gl.vm.unpack_result(gl.vm.spawn_sandbox(verdicts)))
-        want = "".join("T" if example["ok"] else "F" for example in examples)
+        # The deterministic gate. Consensus fixed the policy; this decides
+        # whether it is the one the author asked for, in ordinary code.
+        got = "".join("T" if all(_apply(r, e["text"]) for r in policy) else "F" for e in examples)
+        want = "".join("T" if e["ok"] else "F" for e in examples)
         if got != want:
             disagreed = [i for i in range(len(want)) if got[i] != want[i]]
             return json.dumps({
@@ -363,8 +419,8 @@ class Codify(gl.Contract):
                 "expected": want,
                 "got": got,
                 "on_examples": disagreed,
-                "exprs": exprs,
-                "detail": "the compiled rules disagree with your examples, so nothing was stored",
+                "policy": policy,
+                "detail": "the bound predicates disagree with your examples, so nothing was stored",
             })
 
         set_id = len(self.sets)
@@ -372,42 +428,35 @@ class Codify(gl.Contract):
             name=name,
             author=gl.message.sender_address,
             source=source,
-            exprs="\n".join(exprs),
+            policy=policy_text,
             examples=examples_json,
-            behaviour=behaviour,
             at=u64(int(datetime.datetime.now(datetime.timezone.utc).timestamp())),
         ))
         self.by_name[name] = u32(set_id)
-        return json.dumps({"ok": True, "id": set_id, "name": name, "rules": len(exprs), "exprs": exprs})
+        return json.dumps({"ok": True, "id": set_id, "name": name,
+                           "rules": len(policy), "policy": policy})
 
     # ---------- views ----------
 
     @gl.public.view
     def check(self, name: str, subject: str) -> str:
-        """Apply a rule set. No model, no consensus, no cost.
+        """Apply a rule set. No model, no consensus, no cost, no eval.
 
-        This is the method the contract exists to make possible, and it is
-        ordinary code. Two people running it a year apart on the same subject
-        get the same answer, and can each read why.
+        The contract walks its own predicates. Two people running this a year
+        apart on the same subject get the same answer, and can each read why.
         """
         index = self._find(name)
         _require(len(subject) <= _MAX_SUBJECT,
                  "the subject is longer than " + str(_MAX_SUBJECT) + " characters")
-        entry = self.sets[index]
-        exprs = entry.exprs.split("\n")
-        rules = _lines(entry.source)
-
-        def evaluate():
-            return "".join(_run_one(expr, subject) for expr in exprs)
-
-        results = str(gl.vm.unpack_result(gl.vm.spawn_sandbox(evaluate)))
+        policy = self._policy(index)
+        rules = _lines(self.sets[index].source)
+        results = _verdicts(policy, subject)
         detail = []
-        for i in range(len(exprs)):
-            outcome = results[i] if i < len(results) else "E"
+        for i in range(len(policy)):
             detail.append({
                 "rule": rules[i] if i < len(rules) else "",
-                "expression": exprs[i],
-                "result": {"T": "pass", "F": "fail", "E": "error"}[outcome],
+                "predicate": policy[i],
+                "result": "pass" if results[i] == "T" else "fail",
             })
         return json.dumps({
             "name": name,
@@ -418,15 +467,16 @@ class Codify(gl.Contract):
 
     @gl.public.view
     def explain(self, name: str) -> str:
-        """The English, the Python it became, and the examples that vouched for it."""
-        entry = self.sets[self._find(name)]
+        """The English, the predicates it bound to, and the examples that vouched."""
+        index = self._find(name)
+        entry = self.sets[index]
         return json.dumps({
             "name": entry.name,
             "author": entry.author.as_hex,
             "source": entry.source,
-            "expressions": entry.exprs.split("\n"),
+            "policy": self._policy(index),
+            "canonical": entry.policy,
             "examples": entry.examples,
-            "behaviour_on_probes": entry.behaviour,
             "at": int(entry.at),
         })
 
@@ -439,6 +489,18 @@ class Codify(gl.Contract):
         return "\n".join(entry.name for entry in self.sets)
 
     @gl.public.view
-    def vocabulary(self) -> str:
-        """What an expression is allowed to name. Everything else is absent."""
-        return ", ".join(_ALLOWED)
+    def catalogue(self) -> str:
+        """Every predicate this contract will ever enforce.
+
+        The complete vocabulary of every policy that can be stored here, so a
+        reader can see the outer edge of what they might be subjected to before
+        anybody writes a rule.
+        """
+        out = []
+        for op in sorted(_CATALOGUE.keys()):
+            spec = _CATALOGUE[op]
+            args = list(spec["ints"]) + list(spec["texts"]) + list(spec["lists"])
+            if spec["ci"]:
+                args.append("ci")
+            out.append(op + "(" + ", ".join(args) + ")")
+        return "\n".join(out)
