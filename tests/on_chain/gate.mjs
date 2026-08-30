@@ -21,7 +21,7 @@ let pass=0,fail=0;
 const ok=(n,c,d="")=>{c?pass++:fail++;console.log(`${c?"PASS":"FAIL"}  ${n}${d?"  — "+d:""}`);};
 /* A Codify holding a rule set named "no-spam". Override it when you run this
    against your own: CODIFY=0x… node tests/on_chain/gate.mjs */
-const CODIFY = process.env.CODIFY || "0x94B1488ad7448F193D1bb00225e2a1ae77870637";
+const CODIFY = process.env.CODIFY || "0x37c472780A4F20F12356010cba0D72686FCa6083";
 const acc=createAccount(generatePrivateKey());
 await rpc("sim_fundAccount",{account_address:acc.address,amount:300e18});
 const c=createClient({chain:studionet,account:acc}), rd=createClient({chain:studionet});

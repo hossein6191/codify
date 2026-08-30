@@ -63,6 +63,12 @@ deterministic, no model.
 6 passed, 0 failed           Gate 0x7E8e5920687D87dd0317078A2de59f2d5c10e515
 ```
 
+That Gate run predates the redesign and read a first-design Codify. The script
+now defaults to the current deployment,
+`0x37c472780A4F20F12356010cba0D72686FCa6083`, whose `check` returns the same
+shape: the consumer reads `passes` and the rule text, neither of which the
+redesign changed.
+
 | assertion | result |
 |---|---|
 | a clean post is accepted | 3 agree → `{"ok": true, "id": 0}` |
@@ -87,7 +93,7 @@ casually.
 | does `spawn_sandbox` bound the work? | `0x402e153B3463C5dEDb85661e6fA49a41779eC4E9` | **no** — a 50,000,000 iteration loop ran to completion in 63 s; a 300 MB string allocated fine |
 | does sandboxed `eval` reach consensus at all? | `0xf78C7A61A5EF669709eC0bb796130E0dc00728E5` | yes — but agreeing on a sample of behaviour is not agreeing on a policy |
 | can a GenLayer contract be called with `gl.evm.contract_interface`? | `0x45F3D7Bd…` | **no** — the deploy dies in the constructor with `exit_code 1` and the address answers *not found* |
-| how long an argument can a `gen_call` view carry? | `0x94B1488a…` | about 250 characters; past that, `RLP string ends with N superfluous bytes` |
+| how long an argument can a `gen_call` view carry? | `0x94B1488a…` (a first-design deployment, kept only as the probe it was) | about 250 characters; past that, `RLP string ends with N superfluous bytes` |
 
 The first probe of the sandbox was itself nearly misleading: its "infinite loop"
 case failed with `NameError`, not a timeout, because `range` was not in that
