@@ -130,6 +130,44 @@ written for them and where it diverged.
 }
 ```
 
+## Verified on the Studio network
+
+Deployed from the author's own wallet `0x0A9fd8Fe0b041974e8F794fCf3Eed352c14cf5fe`.
+The deployed bytecode is byte-identical to `contracts/codify.py` (sha256
+`4052e1fe86b79d89a73a36fe42e4b549891c6541d1d6dbf6c368877b56fd59c5`), and the code
+pulled back off the chain passes `genvm-lint check` — pull it out of the deploy
+transaction and hash it yourself. It contains no `eval` and no `spawn_sandbox`.
+
+Contract [`0x37c47278…`](https://explorer-studio.genlayer.com/address/0x37c472780A4F20F12356010cba0D72686FCa6083)
+([deploy ↗](https://explorer-studio.genlayer.com/tx/0xf7e1acae466bb20fb46465732ce1f63236808a688c29ba94475fc42848057b3e))
+
+**Rule set `no-spam`.** Three rules in English, bound once.
+[propose ↗](https://explorer-studio.genlayer.com/tx/0x0b7ba8819b3b9e39f845d4f5a2e5825a02c88c11069f9d0538f70fb2de72dd32)
+— **3 agree, 2 disagree, 0 idle**.
+
+| the rule, as written | the predicate it bound to |
+|---|---|
+| the text must be at most 280 characters | `{"n":280,"op":"max_chars"}` |
+| it must not contain a URL | `{"any":["http://","https://","www."],"ci":true,"op":"forbid"}` |
+| it must have at most two hashtags | `{"ci":false,"n":2,"of":"#","op":"max_count"}` |
+
+Then, with no model involved at all:
+
+```
+check("no-spam", "an ordinary sentence with #one tag")   → passes, TTT
+check("no-spam", "buy now http://x.example #a #b #c")    → fails,  TFF
+```
+
+**Two validators disagreed, and that is the mechanism working.** They bound a
+different policy and said so. Under the previous design — which compared what
+generated programs *did* on a fixed list of subjects — those two would very
+likely have been counted as agreeing, because different programs behave
+identically on any list chosen in advance. The disagreement was always there;
+only now is it visible.
+
+Read it back with `explain("no-spam")`, or run `check` yourself. It costs nothing
+and will answer the same thing forever.
+
 ## Tests
 
 ```
