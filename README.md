@@ -115,20 +115,27 @@ written for them and where it diverged.
 
 ## Reading a result
 
-`check` returns what happened, rule by rule, with the predicate that decided it:
+`check` returns what happened, rule by rule, with the predicate that decided it.
+This is the verbatim answer of the live contract to
+`check("no-spam", "buy now http://x.example #a #b #c")` — a free view call, so
+you can reproduce it yourself:
 
 ```json
 {
   "name": "no-spam",
   "passes": false,
-  "results": "TFT",
+  "results": "TFF",
   "rules": [
-    {"rule": "at most 280 characters", "predicate": {"n": 280, "op": "max_chars"}, "result": "pass"},
-    {"rule": "must not contain a URL", "predicate": {"any": ["http://"], "ci": true, "op": "forbid"}, "result": "fail"},
-    {"rule": "at most two hashtags", "predicate": {"n": 2, "of": "#", "op": "max_count"}, "result": "pass"}
+    {"rule": "the text must be at most 280 characters", "predicate": {"n": 280, "op": "max_chars"}, "result": "pass"},
+    {"rule": "it must not contain a URL", "predicate": {"any": ["http://", "https://", "www."], "ci": true, "op": "forbid"}, "result": "fail"},
+    {"rule": "it must have at most two hashtags", "predicate": {"ci": false, "n": 2, "of": "#", "op": "max_count"}, "result": "fail"}
   ]
 }
 ```
+
+The author is named too: `explain("no-spam")` reports
+`"author": "0x0A9fd8Fe0b041974e8F794fCf3Eed352c14cf5fe"`, the wallet that
+deployed it.
 
 ## Verified on the Studio network
 
